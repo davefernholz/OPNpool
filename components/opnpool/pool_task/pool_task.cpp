@@ -33,10 +33,15 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <esp_system.h>
+#include <esp_timer.h>
+#include <esp_task_wdt.h>
 #include <esp_types.h>
 #include "esphome/core/log.h"
 #include <string.h>
@@ -60,7 +65,12 @@ namespace opnpool {
 
 constexpr char TAG[] = "pool_task";
 
-constexpr uint32_t POOL_TASK_DELAY_MS       = 100;        ///< Main loop delay between iterations [ms]
+    // Upstream default was 100ms. This does NOT drive responsiveness -- the task spends
+    // nearly all its time blocked in uart_read_bytes() (100ms timeout), so the delay only
+    // applies after a completed packet. What it controls is how often the loop competes with
+    // WiFi/API for CPU, and 20ms is the balance: still reacts promptly to the post-broadcast
+    // transmit window without spinning 5x more than necessary.
+constexpr uint32_t POOL_TASK_DELAY_MS       = 20;         ///< Main loop delay between iterations [ms]
 constexpr uint32_t POOL_REQ_INTERVAL_MS     = 30 * 1000;  ///< Interval between periodic controller queries [ms]
 constexpr uint32_t POOL_REQ_TASK_STACK_SIZE = 2 * 4096;   ///< Stack size for pool_req_task [bytes]
 
@@ -85,13 +95,19 @@ static datalink_addr_t _controller_addr = datalink_addr_t::unknown();
 [[nodiscard]] static bool
 _service_pkts_from_rs485(rs485_handle_t const rs485, ipc_t const * const ipc)
 {
-    datalink_pkt_t pkt;
+    datalink_pkt_t pkt = {};
     network_msg_t msg;
     bool txOpportunity = false;
 
+        // datalink_rx_pkt() allocates pkt.skb up front and does NOT free it on its failure
+        // paths, so ownership lands here on every path. Since the rx state machine is
+        // bounded it returns failure on every timed-out read -- roughly every 2s on a quiet
+        // bus -- so freeing only on success would exhaust the heap. Free unconditionally
+        // below instead.
     if (datalink_rx_pkt(rs485, &pkt) == ESP_OK) {
 
-        if (network_rx_msg(&pkt, &msg, &txOpportunity) == ESP_OK) {
+        esp_err_t const decode_err = network_rx_msg(&pkt, &msg, &txOpportunity);
+        if (decode_err == ESP_OK) {
 
                 // snoop to find the controller address to use as the dst in _queue_req()
             if (msg.src.is_controller()) {
@@ -103,13 +119,15 @@ _service_pkts_from_rs485(rs485_handle_t const rs485, ipc_t const * const ipc)
                 ESP_LOGW(TAG, "Failed to send network message to main task");
             }
 
+        } else if (decode_err == ESP_ERR_NOT_SUPPORTED) {
+                // known-benign undecoded type (see _decode_msg_a5_ctrl); already logged there
         } else {
             ESP_LOGW(TAG, "Failed to decode network message from datalink packet");
         }
-        free(pkt.skb);
     } else {
         ESP_LOGVV(TAG, "No packet received from RS-485");
     }
+    free(pkt.skb);   // safe on every path: nullptr when allocation itself failed
     return txOpportunity;
 }
 
@@ -133,10 +151,18 @@ _service_requests_from_main(rs485_handle_t rs485, ipc_t const * const ipc)
     if (xQueueReceive(ipc->to_pool_q, &msg, (TickType_t)0) == pdPASS) {
 
         datalink_pkt_t * const pkt = static_cast<datalink_pkt_t*>(calloc(1, sizeof(datalink_pkt_t)));
+        if (pkt == nullptr) {
+                // network_create_pkt() writes through this pointer before any null check.
+                // The message is already dequeued, so log it -- a silently dropped user
+                // command is worse than a noisy one.
+            ESP_LOGE(TAG, "out of memory; dropping outgoing command");
+            return;
+        }
 
         if (network_create_pkt(&msg, pkt) == ESP_OK) {
 
-            datalink_tx_pkt_queue(rs485, pkt);  // pkt and pkt->skb freed by recipient
+                // urgent: this came from Home Assistant, do not let it wait behind polls
+            datalink_tx_pkt_queue(rs485, pkt, /*urgent=*/true);  // pkt and pkt->skb freed by recipient
             return;
         }
         if (pkt->skb) free(pkt->skb);
@@ -166,6 +192,10 @@ _queue_req(rs485_handle_t const rs485, network_msg_typ_t const typ)
     msg.dst = _controller_addr;  // use controller address
 
     datalink_pkt_t * const pkt = static_cast<datalink_pkt_t*>(calloc(1, sizeof(datalink_pkt_t)));
+    if (pkt == nullptr) {
+        ESP_LOGE(TAG, "out of memory; dropping periodic request");
+        return;
+    }
 
     if (network_create_pkt(&msg, pkt) == ESP_OK) {
 
@@ -257,10 +287,17 @@ pool_req_task(void * rs485_void)
             continue;
         }
         _queue_req(rs485, network_msg_typ_t::CTRL_VERSION_REQ);
-        //_queue_req(rs485, network_msg_typ_t::CTRL_TIME_REQ);
+        _queue_req(rs485, network_msg_typ_t::CTRL_TIME_REQ);   // needed to read/verify the controller clock
 
         _queue_req(rs485, network_msg_typ_t::CTRL_HEAT_REQ);
         _queue_req(rs485, network_msg_typ_t::CTRL_SCHED_REQ);
+
+            // Valve status is never requested upstream, so network_ctrl_valve_resp_t has stayed
+            // an undecoded `uint8_t unknown[24]`. Ask for it -- CTRL_VALVE_RESP already logs its
+            // raw bytes -- so the payload can be correlated against known valve positions
+            // (pool mode vs spa mode move the intake/return actuators) and actually decoded.
+            // Read-only: requesting status changes nothing on the controller.
+        _queue_req(rs485, network_msg_typ_t::CTRL_VALVE_REQ);
     }
 }
 
@@ -291,11 +328,38 @@ pool_task(void * ipc_void)
 
     ipc_t * const ipc = static_cast<ipc_t*>(ipc_void);
     rs485_handle_t const rs485 = rs485_init(&ipc->config.rs485_pins);
+    if (rs485 == nullptr) {
+            // rs485_init() returns nullptr on queue/alloc failure. Every use below loads a
+            // function pointer through this handle, so continuing panics on the first loop
+            // iteration -- a reboot loop that never gets far enough to accept an OTA.
+        ESP_LOGE(TAG, "rs485_init failed; pool_task exiting (no RS-485 comms)");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+        // Subscribe to the ESP-IDF task watchdog; the timeout and the panic-on-expire
+        // behaviour come from the ESP-IDF / ESPHome sdkconfig defaults
+        // (CONFIG_ESP_TASK_WDT_TIMEOUT_S, CONFIG_ESP_TASK_WDT_PANIC), which this project does
+        // not override -- check the generated sdkconfig for the values in force. Without it, a
+        // hang in this task leaves the device looking alive (WiFi/API up, pings fine) while
+        // pool control is silently dead -- the worst failure mode for equipment left
+        // unattended for months. With it, a hang reboots the device instead.
+        // The loop feeds it once per iteration; the normal path blocks for well under a
+        // second because uart_read_bytes uses a 100ms timeout and the preamble scan is
+        // byte-bounded.
+    if (esp_task_wdt_add(nullptr) != ESP_OK) {
+        ESP_LOGW(TAG, "could not subscribe pool_task to the task watchdog");
+    }
 
         // periodically request information from controller
-    if (xTaskCreate(&pool_req_task, "pool_req_task", POOL_REQ_TASK_STACK_SIZE, rs485, 5, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(&pool_req_task, "pool_req_task", POOL_REQ_TASK_STACK_SIZE, rs485, 5, NULL, 1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create pool_req_task");
     }
+
+        // Heartbeat proving THIS task's loop is still running, independent of RS485 activity
+        // (pool_req_task's own periodic log is a different task). Time-based rather than
+        // iteration-based, since one iteration takes anywhere from ~0 to ~2s.
+    int64_t last_heartbeat_us = esp_timer_get_time();
 
     while (1) {
 
@@ -308,13 +372,28 @@ pool_task(void * ipc_void)
 
         if (_service_pkts_from_rs485(rs485, ipc)) {
 
+                // Drain the IPC queue again before transmitting. _service_pkts_from_rs485()
+                // blocks for up to ~2s, and a Home Assistant command that arrives during that
+                // window would otherwise still be sitting in to_pool_q when we get here --
+                // so tx_q is empty, this transmit opportunity is wasted, and the command waits
+                // a whole extra broadcast interval. Measured: this accounted for ~1.9s of a
+                // ~2.7s round trip; the bus write plus controller ACK is only ~58ms.
+            _service_requests_from_main(rs485, ipc);
+
                 // there is a transmit opportunity after the pool controller
                 // send a broadcast.  If there is rs485 transmit queue, then
                 // create a network message and transmit it.
 
             _forward_queued_pkt_to_rs485(rs485, ipc);
         }
-         vTaskDelay((TickType_t)POOL_TASK_DELAY_MS / portTICK_PERIOD_MS);
+        esp_task_wdt_reset();   // we are alive; see esp_task_wdt_add() above
+
+        int64_t const now_us = esp_timer_get_time();
+        if (now_us - last_heartbeat_us >= 5000000) {
+            last_heartbeat_us = now_us;
+            ESP_LOGD(TAG, "pool_task heartbeat: loop alive");
+        }
+        vTaskDelay((TickType_t)POOL_TASK_DELAY_MS / portTICK_PERIOD_MS);
     }
 }
 

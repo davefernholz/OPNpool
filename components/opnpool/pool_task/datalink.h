@@ -19,6 +19,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -213,13 +216,18 @@ uint16_t datalink_calc_checksum(uint8_t const * const start, uint8_t const * con
  */
 [[nodiscard]] esp_err_t datalink_rx_pkt(rs485_handle_t const rs485, datalink_pkt_t * const pkt);
 
+/// @brief Packets that failed checksum validation since boot (RS-485 bus health).
+uint32_t datalink_corrupt_pkt_count();
+/// @brief Packets successfully received and validated since boot.
+uint32_t datalink_good_pkt_count();
+
 /**
  * @brief Adds protocol headers and tails to a data packet and queues it for RS485 transmission.
  *
  * @param[in] rs485 Pointer to the RS485 interface handle.
  * @param[in] pkt   Pointer to the datalink packet structure to be transmitted.
  */
-void datalink_tx_pkt_queue(rs485_handle_t const rs485, datalink_pkt_t const * const pkt);
+void datalink_tx_pkt_queue(rs485_handle_t const rs485, datalink_pkt_t const * const pkt, bool const urgent = false);
 
 } // namespace opnpool
 } // namespace esphome

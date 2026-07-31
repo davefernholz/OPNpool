@@ -9,6 +9,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -81,6 +84,22 @@ class OpnPoolSwitch : public switch_::Switch, public Component {
         .valid = false,
         .value = false
     };
+
+    /**
+     * @brief Optimistic-write bookkeeping, to stop the toggle flickering in Home Assistant.
+     *
+     * A command is not put on the RS-485 bus immediately: it waits for a transmit
+     * opportunity (up to ~1s, gated on a controller broadcast) and the controller then
+     * takes a moment to act. In the meantime the controller keeps broadcasting the OLD
+     * circuit state, so without this the UI goes ON -> OFF -> ON.
+     *
+     * While a write is pending we publish the requested value straight away and ignore
+     * contradicting controller updates, until either the controller confirms the value or
+     * the deadline expires (so a genuinely failed command still reverts and is visible).
+     */
+    bool    pending_valid_ = false;  ///< True while a write is awaiting confirmation.
+    bool    pending_value_ = false;  ///< The value we asked the controller for.
+    int64_t pending_until_us_ = 0;   ///< esp_timer deadline after which we stop suppressing.
 };
 
 }  // namespace opnpool

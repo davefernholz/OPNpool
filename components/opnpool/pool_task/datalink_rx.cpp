@@ -17,6 +17,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -43,6 +46,14 @@ namespace esphome {
 namespace opnpool {
 
 constexpr char TAG[] = "datalink_rx";
+
+    // Bus-health counters, exposed to Home Assistant as diagnostic sensors. A rising
+    // corrupt-packet count is the earliest warning of RS-485 trouble (loose connection,
+    // noise, contention) -- this project spent a long night on exactly that failure.
+static uint32_t _corrupt_pkts = 0;
+static uint32_t _good_pkts    = 0;
+uint32_t datalink_corrupt_pkt_count() { return _corrupt_pkts; }
+uint32_t datalink_good_pkt_count()    { return _good_pkts; }
 
     // protocol preamble matching state
 struct proto_info_t {
@@ -167,9 +178,29 @@ _find_preamble(rs485_handle_t const rs485, local_data_t * const local, datalink_
     uint8_t const buf_size = 40;
     char dbg[buf_size];
 
+        // The MAX_PREAMBLE_RETRIES cap in datalink_rx_pkt() bounds how many times this
+        // function is re-entered, but NOT a single call: as long as bytes keep arriving,
+        // read_bytes() keeps returning 1 and this loop never exits. That covers a quiet bus
+        // but not a noisy one (floating bus, a device at the wrong baud, sustained EMI),
+        // where pool_task's outer loop -- tx queue servicing, heartbeat -- is starved exactly
+        // as it was before the retry cap, and without tripping the task watchdog because
+        // uart_read_bytes() yields. Bound the scan by bytes as well as by retries.
+    constexpr uint32_t MAX_SCAN_BYTES = 128;   // ~2x the longest legitimate frame
+    uint32_t scanned = 0;
+
     uint8_t byt;
     while (rs485->read_bytes(&byt, 1) == 1) {
-        if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE) {
+        if (++scanned > MAX_SCAN_BYTES) {
+            ESP_LOGW(TAG, "no preamble in %lu bytes; yielding to let pool_task run",
+                     (unsigned long)MAX_SCAN_BYTES);
+            return ESP_FAIL;
+        }
+            // The `len < buf_size` guard is required: len can exceed buf_size (e.g. A5_CTRL
+            // frames are preceded by long runs of idle 0xFF bytes while waiting for sync,
+            // easily overflowing this small debug buffer's ~13-byte-before-truncation
+            // budget), and buf_size - len would then underflow in uint8_t arithmetic,
+            // handing snprintf a garbage size on an out-of-bounds pointer.
+        if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE && len < buf_size) {
             len += snprintf(dbg + len, buf_size - len, " %02X", byt);
         }
         bool part_of_preamble = false;
@@ -316,7 +347,8 @@ _read_data(rs485_handle_t const rs485, [[maybe_unused]] local_data_t * const loc
     if (rs485->read_bytes((uint8_t *) pkt->data, pkt->data_len) == pkt->data_len) {
         if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE) {
             uint8_t len = 0;
-            for (uint_least8_t ii = 0; ii < pkt->data_len; ii++) {
+            // same underflow risk as _find_preamble() above: guard against len reaching buf_size.
+            for (uint_least8_t ii = 0; ii < pkt->data_len && len < buf_size; ii++) {
                 len += snprintf(buf + len, buf_size - len, " %02X", pkt->data[ii]);
             }
             ESP_LOGV(TAG, "%s (data)", buf);
@@ -409,6 +441,7 @@ _check_checksum([[maybe_unused]] rs485_handle_t const rs485, local_data_t * cons
         return ESP_OK;
     }
 
+    _corrupt_pkts++;
     ESP_LOGW(TAG, "checksum err (rx=0x%03x calc=0x%03x)", checksum.rx, checksum.calc);
     return ESP_FAIL;
 }
@@ -460,6 +493,21 @@ datalink_rx_pkt(rs485_handle_t const rs485, datalink_pkt_t * const pkt)
     local_data_t local;
     local.head = (datalink_head_t *) skb_put(pkt->skb, DATALINK_MAX_HEAD_SIZE);
 
+        // The state loop below must stay bounded: STATE_FIND_PREAMBLE's on_err transition
+        // points back to itself, and _find_preamble() blocks for up to RX_TIMEOUT (100ms) per
+        // attempt when there are no valid bytes on the bus. Without an escape this function
+        // would never return while the bus is quiet, starving pool_task's outer loop (TX queue
+        // servicing, heartbeat, everything) for the whole duration of the outage. Capping
+        // consecutive preamble-search failures returns control to the caller periodically even
+        // while waiting for the next valid frame; the caller's own while(1) loop calls back in.
+        // Kept at 20 deliberately. Lowering it to 3 was tried as a latency optimisation: it
+        // did bound the IPC pickup delay to ~300ms as intended, but measured round trips got
+        // WORSE (1.0-1.7s vs 0.06s for the transmit stage), most likely because bailing out
+        // mid-frame abandons a partially-received broadcast and costs us the transmit window
+        // it would have granted. Reverted -- do not re-apply without a large sample.
+    constexpr uint16_t MAX_PREAMBLE_RETRIES = 20;  // ~20 * up to RX_TIMEOUT(100ms) = ~2s worst case
+    uint16_t preamble_retries = 0;
+
     while (true) {
         state_transition_t * transition = state_transitions;
         for (uint_least8_t ii = 0; ii < ARRAY_SIZE(state_transitions); ii++, transition++) {
@@ -480,6 +528,9 @@ datalink_rx_pkt(rs485_handle_t const rs485, datalink_pkt_t * const pkt)
                     case STATE_FIND_PREAMBLE:
                         skb_reset(pkt->skb);
                         local.head = (datalink_head_t *) skb_put(pkt->skb, DATALINK_MAX_HEAD_SIZE);
+                        if (++preamble_retries >= MAX_PREAMBLE_RETRIES) {
+                            return ESP_FAIL;
+                        }
                         break;
                     case STATE_READ_HEAD:
                         skb_trim(pkt->skb, DATALINK_MAX_HEAD_SIZE - local.head_len);  // release unused bytes
@@ -493,6 +544,7 @@ datalink_rx_pkt(rs485_handle_t const rs485, datalink_pkt_t * const pkt)
                     case STATE_CHECK_CHECKSUM:
                         break;
                     case STATE_DONE:
+                        _good_pkts++;
                         return ESP_OK;
                 }
                 state = new_state;

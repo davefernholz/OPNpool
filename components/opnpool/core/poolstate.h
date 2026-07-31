@@ -21,6 +21,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -41,6 +44,7 @@
 #endif
 #define MAGIC_ENUM_RANGE_MIN 0
 #define MAGIC_ENUM_RANGE_MAX 256
+#include <cstring>
 #include "utils/magic_enum.h"
 #include "pool_task/network.h"
 #include "pool_task/network_msg.h"

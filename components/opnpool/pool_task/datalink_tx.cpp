@@ -17,9 +17,13 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <cstring>
 #include <esp_system.h>
 #include <esp_types.h>
 #include <esphome/core/log.h>
@@ -44,7 +48,10 @@ constexpr size_t DBG_SIZE = 128;
 constexpr size_t DATALINK_PREAMBLE_IC_SIZE = sizeof(datalink_preamble_ic);
 constexpr size_t DATALINK_PREAMBLE_A5_SIZE = sizeof(datalink_preamble_a5);
 
-constexpr uint8_t A5_PROTOCOL_VERSION = 0x01;
+// Every real A5_CTRL frame observed on this bus (broadcasts, the physical remote's
+// commands, and the controller's ACKs) uses 0x03 here, not 0x01 -- the controller
+// silently ignores frames with the wrong value, so writes never landed.
+constexpr uint8_t A5_PROTOCOL_VERSION = 0x03;
 
 /**
  * @brief          Fills the IC protocol packet header fields for transmission.
@@ -128,7 +135,7 @@ _enter_a5_tail(datalink_tail_a5_t * const tail, uint8_t const * const start, uin
  * @param[in] pkt   Pointer to the datalink packet structure to be transmitted.
  */
 void
-datalink_tx_pkt_queue(rs485_handle_t const rs485, datalink_pkt_t const * const pkt)
+datalink_tx_pkt_queue(rs485_handle_t const rs485, datalink_pkt_t const * const pkt, bool const urgent)
 {
     skb_handle_t const skb = pkt->skb;
 
@@ -167,7 +174,7 @@ datalink_tx_pkt_queue(rs485_handle_t const rs485, datalink_pkt_t const * const p
     }
 
         // queue for transmission by `pool_task`
-    rs485->queue(rs485, pkt);
+    rs485->queue(rs485, pkt, urgent);
 }
 
 } // namespace opnpool

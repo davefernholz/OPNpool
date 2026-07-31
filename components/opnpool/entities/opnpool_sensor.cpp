@@ -18,6 +18,7 @@
 
 #include <esp_system.h>
 #include <esp_types.h>
+#include <cmath>
 #include <esphome/core/log.h>
 
 #include "opnpool_sensor.h"
@@ -60,7 +61,14 @@ OpnPoolSensor::dump_config()
 void
 OpnPoolSensor::publish_value_if_changed(float value, float tolerance)
 {
-    if (!last_.valid || fabs(last_.value - value) > tolerance) {
+        // NaN needs explicit handling: fabs(last_ - NAN) is NaN and every comparison against
+        // it is false, so a NaN would silently never publish -- and once one did land, every
+        // later real value would fail the same comparison and the sensor would stay stuck.
+        // Publish on entering or leaving NaN, otherwise compare normally.
+    bool const now_nan = std::isnan(value);
+    bool const was_nan = last_.valid && std::isnan(last_.value);
+    if (!last_.valid || (now_nan != was_nan) ||
+        (!now_nan && fabs(last_.value - value) > tolerance)) {
 
         this->publish_state(value);
         

@@ -12,9 +12,13 @@
  * 
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <cstring>
 #include <esp_system.h>
 #include <esp_types.h>
 #include <esp_log.h>
@@ -86,6 +90,21 @@ _decode_msg_a5_ctrl(datalink_pkt_t const * const pkt, network_msg_t * const msg)
 
     network_msg_typ_info_t const * const info = network_msg_typ_get_info(datalink_ctrl_typ);
     if (info == nullptr) {
+            // 0x6E is expected, benign traffic: the controller polls addresses 0x11-0x13
+            // roughly once a minute and nothing ever answers, which is consistent with it
+            // probing for optional equipment that is not installed. It is undecoded here and
+            // also has no handler in nodejs-poolController, the most complete open
+            // implementation of this protocol -- so it is genuinely undocumented rather than
+            // an oversight. Logging it at WARN produced six warnings a minute forever, which
+            // is exactly the sort of constant noise that teaches you to ignore real warnings.
+        if (static_cast<uint8_t>(datalink_ctrl_typ) == 0x6E) {
+            ESP_LOGD(TAG, "unsupported ctrl_typ (6E) src=0x%02X dst=0x%02X len=%u",
+                     pkt->src.addr, pkt->dst.addr, pkt->data_len);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+            // Genuinely unexpected type: keep this at WARN, on this tag. Do not route it
+            // through IDF's ESP_LOG_LEVEL -- ESPHome does not override that macro, so it
+            // re-emits under the "esp-idf" tag at INFO and the level is lost.
         ESP_LOGW(TAG, "unsupported ctrl_typ (%s) src=0x%02X dst=0x%02X len=%u",
                  enum_str(datalink_ctrl_typ), pkt->src.addr, pkt->dst.addr, pkt->data_len);
         ESP_LOG_BUFFER_HEX_LEVEL(TAG, pkt->data, pkt->data_len, ESP_LOG_WARN);

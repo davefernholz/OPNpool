@@ -25,10 +25,15 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <esp_system.h>
+#include <cmath>
+#include <esp_timer.h>
 #include <esp_types.h>
 #include <esphome/core/log.h>
 #include <esphome/core/hal.h>
@@ -61,7 +66,9 @@ namespace opnpool {
 constexpr char TAG[] = "opnpool";
 
 constexpr uint32_t    POOL_TASK_STACK_SIZE = 2 * 4096;
-constexpr UBaseType_t TO_POOL_QUEUE_LEN = 6;
+static bool _pump_data_stale();   // defined below, used by update_analog_sensors()
+
+constexpr UBaseType_t TO_POOL_QUEUE_LEN = 12;  // request_circuit_config() enqueues 9 at once; 6 silently dropped ids 7-9
 constexpr UBaseType_t TO_MAIN_QUEUE_LEN = 10;
 
 /**
@@ -273,16 +280,29 @@ OpnPool::setup() {
         if (ipc_->to_pool_q) vQueueDelete(ipc_->to_pool_q);
         delete ipc_;
         delete poolState_;
+            // Null them and fail the component: loop() and dump_config() run unconditionally
+            // and dereference these, so leaving dangling pointers turns an out-of-memory at
+            // setup into a use-after-free on every loop iteration.
+        ipc_ = nullptr;
+        poolState_ = nullptr;
+        this->mark_failed();
         return;
     }
 
         // spin off a pool_task to handle RS485 communication, datalink layer and network layer
-    if (xTaskCreate(&pool_task, "pool_task", POOL_TASK_STACK_SIZE, this->ipc_, 3, &pool_task_handle_) != pdPASS) {
+        // Pin to core 1: the ESPHome main loop, the API and the WiFi task are all pinned to
+        // core 0, and pool_task runs at priority 3 vs the main loop's 1 -- unpinned it would
+        // preempt entity publishing on core 0 while core 1 sat idle.
+    if (xTaskCreatePinnedToCore(&pool_task, "pool_task", POOL_TASK_STACK_SIZE, this->ipc_, 3, &pool_task_handle_, 1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create pool_task");
         if (ipc_->to_main_q) vQueueDelete(ipc_->to_main_q);
         if (ipc_->to_pool_q) vQueueDelete(ipc_->to_pool_q);
         delete ipc_;
         delete poolState_;
+            // null and fail as above, to keep loop()/dump_config() off dangling pointers
+        ipc_ = nullptr;
+        poolState_ = nullptr;
+        this->mark_failed();
         return;
     }
 
@@ -359,6 +379,8 @@ OpnPool::~OpnPool()
 void
 OpnPool::loop() {
 
+    if (ipc_ == nullptr || poolState_ == nullptr) return;   // setup failed
+
     network_msg_t msg = {};
 
     if (xQueueReceive(ipc_->to_main_q, &msg, 0) == pdPASS) {  // check if a message is available
@@ -428,6 +450,10 @@ void
 OpnPool::dump_config() {
 
     ESP_LOGCONFIG(TAG, "OpnPool:");
+    if (this->ipc_ == nullptr) {          // setup failed; ipc_ was freed and nulled
+        ESP_LOGCONFIG(TAG, "  SETUP FAILED -- no RS-485 communication");
+        return;
+    }
     ESP_LOGCONFIG(TAG, "  RS485 rx pin: %u", this->ipc_->config.rs485_pins.rx_pin);
     ESP_LOGCONFIG(TAG, "  RS485 tx pin: %u", this->ipc_->config.rs485_pins.tx_pin);
     ESP_LOGCONFIG(TAG, "  RS485 rts pin: %u", this->ipc_->config.rs485_pins.rts_pin);
@@ -557,6 +583,17 @@ OpnPool::update_analog_sensors(poolstate_t const * const state)
         auto solar2_temp_f = std::round(solar2_temp.value * 10.0f) / 10.0f;
         solar2_sensor->publish_value_if_changed(solar2_temp_f);
     }   
+        // When the pump stops broadcasting, publish NaN rather than the last decoded value.
+        // Home Assistant renders that as "unknown", which is honest; a stale wattage is
+        // indistinguishable from a live one and hides a pump that has dropped off the bus.
+    if (_pump_data_stale()) {
+        for (auto id : { sensor_id_t::PRIMARY_PUMP_POWER, sensor_id_t::PRIMARY_PUMP_FLOW,
+                         sensor_id_t::PRIMARY_PUMP_SPEED }) {
+            if (this->sensors_[enum_index(id)] != nullptr) {
+                this->sensors_[enum_index(id)]->publish_value_if_changed(NAN);
+            }
+        }
+    } else {
     _publish_if(
         this->sensors_[enum_index(sensor_id_t::PRIMARY_PUMP_POWER)],        
         state->pumps[enum_index(datalink_pump_id_t::PRIMARY)].power
@@ -569,6 +606,7 @@ OpnPool::update_analog_sensors(poolstate_t const * const state)
         this->sensors_[enum_index(sensor_id_t::PRIMARY_PUMP_SPEED)],        
         state->pumps[enum_index(datalink_pump_id_t::PRIMARY)].speed
     );
+    }
     _publish_if(
         this->sensors_[enum_index(sensor_id_t::PRIMARY_PUMP_ERROR)],        
         state->pumps[enum_index(datalink_pump_id_t::PRIMARY)].error
@@ -589,12 +627,31 @@ OpnPool::update_analog_sensors(poolstate_t const * const state)
  * @param[in] state Pointer to the current pool state.
  */
 
+    /// @brief True when no pump status message has arrived recently.
+    /// @details An IntelliFlo broadcasts continuously while it is powered, so silence means
+    /// it is not running -- but the decoded values are sticky and would otherwise keep
+    /// reporting the last known wattage and `running: ON` indefinitely. Five minutes is well
+    /// clear of the normal broadcast interval. If the receiver itself has failed this also
+    /// goes stale, which is why the bus health counters exist to tell the two apart.
+static bool
+_pump_data_stale()
+{
+    int64_t const seen = poolstate_rx::pump_last_seen_us();
+    if (seen == 0) {
+        return false;   // nothing seen since boot: leave entities untouched rather than
+                        // asserting a state we have never observed
+    }
+    constexpr int64_t PUMP_STALE_US = 5 * 60 * 1000000LL;
+    return (esp_timer_get_time() - seen) > PUMP_STALE_US;
+}
+
 void
 OpnPool::update_binary_sensors(poolstate_t const * const state)
 {
     _publish_if(
-        this->binary_sensors_[enum_index(binary_sensor_id_t::PRIMARY_PUMP_POWER)],           
-        state->pumps[enum_index(datalink_pump_id_t::PRIMARY)].running
+        this->binary_sensors_[enum_index(binary_sensor_id_t::PRIMARY_PUMP_POWER)],
+        _pump_data_stale() ? poolstate_bool_t{ .valid = true, .value = false }
+                           : state->pumps[enum_index(datalink_pump_id_t::PRIMARY)].running
     );
     _publish_modes_if(
         this->binary_sensors_,
@@ -915,6 +972,169 @@ OpnPool::get_matter_qr_code(char * buf, size_t buf_size) const
     return matter_bridge_->get_qr_code(buf, buf_size);
 }
 #endif  // USE_MATTER
+
+/**
+ * @brief Ask the controller what each circuit is configured as (read-only).
+ */
+void
+OpnPool::request_circuit_config()
+{
+    poolstate_t state;
+    poolState_->get(&state);
+
+    datalink_addr_t const controller_addr = state.system.addr.value;
+    if (!controller_addr.is_controller()) {
+        ESP_LOGW(TAG, "circuit config request skipped: controller address not learned yet");
+        return;
+    }
+
+        // One request per circuit id; responses arrive asynchronously and are logged by the
+        // CTRL_CIRC_NAMES_RESP handler. Read-only -- this asks the controller what a circuit
+        // is assigned to rather than toggling it, which matters for unknown circuits that
+        // might be wired to equipment that should not be started unattended.
+    for (uint8_t id = 1; id <= 9; id++) {
+        network_msg_t msg = {};
+        msg.src = datalink_addr_t::remote();
+        msg.dst = controller_addr;
+        msg.typ = network_msg_typ_t::CTRL_CIRC_NAMES_REQ;
+        msg.u.a5.ctrl_circ_names_req = { .req_id = id };
+
+        if (ipc_send_network_msg_to_pool_task(&msg, ipc_) != ESP_OK) {
+            ESP_LOGW(TAG, "failed to queue circuit config request %u", id);
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "requested circuit config for ids 1..9");
+}
+
+
+/**
+ * @brief Set the controller clock only if it has drifted beyond a tolerance.
+ */
+bool
+OpnPool::set_controller_clock_if_drifted(uint8_t hour, uint8_t minute, uint8_t dow_sun0,
+                                         uint8_t day, uint8_t month, uint8_t year_2000,
+                                         uint8_t tolerance_minutes)
+{
+    poolstate_t state;
+    poolState_->get(&state);
+
+    if (!state.system.tod.time.valid) {
+        ESP_LOGD(TAG, "drift check skipped: controller time not known yet");
+        return false;
+    }
+
+    int const ctrl_min = state.system.tod.time.value.hour * 60 + state.system.tod.time.value.minute;
+    int const ours_min = hour * 60 + minute;
+
+        // Circular difference so 23:59 vs 00:01 reads as 2 minutes, not 1438.
+    int diff = ours_min - ctrl_min;
+    if (diff >  720) diff -= 1440;
+    if (diff < -720) diff += 1440;
+    int const drift = diff < 0 ? -diff : diff;
+
+    if (drift < static_cast<int>(tolerance_minutes)) {
+        ESP_LOGD(TAG, "clock drift %d min, within tolerance %u -- not correcting", drift, tolerance_minutes);
+        return false;
+    }
+
+        // CONFIRMED BEHAVIOUR: writing the clock makes the controller cycle the pump off and
+        // back on (verified by pressing the sync button and watching the equipment). Never do
+        // that unattended while water is moving -- defer until the pool/spa circuit is off,
+        // when the stop/restart is a no-op. The manual button bypasses this deliberately.
+    uint8_t const pool_idx = enum_index(network_pool_circuit_t::POOL);
+    uint8_t const spa_idx  = enum_index(network_pool_circuit_t::SPA);
+    bool const pool_on = state.circuits[pool_idx].active.valid && state.circuits[pool_idx].active.value;
+    bool const spa_on  = state.circuits[spa_idx].active.valid  && state.circuits[spa_idx].active.value;
+    if (pool_on || spa_on) {
+        ESP_LOGI(TAG, "clock drift %d min, but pool/spa is running -- deferring correction", drift);
+        return false;
+    }
+    ESP_LOGI(TAG, "clock drift %d min exceeds tolerance %u -- correcting", drift, tolerance_minutes);
+    set_controller_clock(hour, minute, dow_sun0, day, month, year_2000);
+    return true;
+}
+
+
+/**
+ * @brief Set the pool controller's real-time clock (see header for the byte layout).
+ */
+void
+OpnPool::set_light_theme(uint8_t theme)
+{
+        // Null-guard both pointers. Unlike the clock setter -- which is only reachable from a
+        // button or a scheduled trigger, long after setup -- this can be driven by a `select`
+        // whose on_value fires while ESPHome is still bringing components up. Dereferencing
+        // poolState_ there crashes on boot, and five such crashes drop the device into safe
+        // mode, where it has no API and no web server and so cannot report why.
+    if (poolState_ == nullptr || ipc_ == nullptr) {
+        ESP_LOGW(TAG, "light theme %u ignored: component not ready yet", theme);
+        return;
+    }
+
+    poolstate_t state;
+    poolState_->get(&state);
+
+    datalink_addr_t const controller_addr = state.system.addr.value;
+    if (!controller_addr.is_controller()) {
+        ESP_LOGW(TAG, "light theme skipped: controller address not learned yet");
+        return;
+    }
+
+    network_msg_t msg = {};
+    msg.src = datalink_addr_t::remote();
+    msg.dst = controller_addr;
+    msg.typ = network_msg_typ_t::CTRL_LIGHT_SET;
+    msg.u.a5.ctrl_light_set = { .theme = theme, .reserved = 0 };
+
+    if (ipc_send_network_msg_to_pool_task(&msg, ipc_) != ESP_OK) {
+        ESP_LOGW(TAG, "failed to queue light theme %u", theme);
+        return;
+    }
+    ESP_LOGI(TAG, "light theme -> %u (0x%02X)", theme, theme);
+}
+
+void
+OpnPool::set_controller_clock(uint8_t hour, uint8_t minute, uint8_t dow_sun0,
+                              uint8_t day, uint8_t month, uint8_t year_2000)
+{
+    poolstate_t state;
+    poolState_->get(&state);
+
+    datalink_addr_t const controller_addr = state.system.addr.value;
+    if (!controller_addr.is_controller()) {
+        ESP_LOGW(TAG, "clock sync skipped: controller address not learned yet");
+        return;
+    }
+    if (hour > 23 || minute > 59 || day < 1 || day > 31 || month < 1 || month > 12 || dow_sun0 > 6) {
+        ESP_LOGW(TAG, "clock sync skipped: implausible time %02u:%02u %02u/%02u/%02u dow=%u",
+                 hour, minute, day, month, year_2000, dow_sun0);
+        return;
+    }
+
+    network_msg_t msg = {};
+    msg.src = datalink_addr_t::remote();
+    msg.dst = controller_addr;
+    msg.typ = network_msg_typ_t::CTRL_TIME_SET;
+    msg.u.a5.ctrl_time = {
+        .time         = { .hour = hour, .minute = minute },
+        .dayoftheweek = static_cast<uint8_t>(1u << dow_sun0),   // bitmask, Sunday = bit 0
+        .date         = { .day = day, .month = month, .year = year_2000 },
+            // Preserve what the controller already reports rather than inventing values:
+            // clk_speed is a calibration trim and dst_auto is a user preference. A real
+            // remote was observed preserving both (00 / 01) when it set the clock.
+        .clk_speed    = poolstate_rx::last_clk_speed(),
+        .dst_auto     = poolstate_rx::last_dst_auto()
+    };
+
+    if (ipc_send_network_msg_to_pool_task(&msg, ipc_) != ESP_OK) {
+        ESP_LOGW(TAG, "failed to queue clock sync");
+        return;
+    }
+    ESP_LOGI(TAG, "clock sync -> %02u:%02u %02u/%02u/20%02u (dow bit %u)",
+             hour, minute, day, month, year_2000, dow_sun0);
+}
+
 
 }  // namespace opnpool
 }  // namespace esphome

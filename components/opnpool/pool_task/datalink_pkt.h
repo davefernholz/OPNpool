@@ -66,6 +66,10 @@ enum class datalink_ctrl_typ_t : uint8_t {
     TIME_RESP        = 0x05,
     TIME_SET         = 0x85,
     TIME_REQ         = 0xC5,
+        /// IntelliBrite light theme/colour. Verified against a live capture of the wired
+        /// remote: `03 10 20 60 02 | <theme> 00`. Does not follow the RESP/SET/REQ 0x00/
+        /// 0x80/0xC0 convention the other messages use -- it is 0x60 as sent.
+    LIGHT_SET        = 0x60,
     CIRCUIT_RESP     = 0x06,
     CIRCUIT_SET      = 0x86,
     CIRCUIT_REQ      = 0xC6,

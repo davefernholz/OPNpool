@@ -27,10 +27,15 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright 2014, 2019, 2022, 2026, Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <cstring>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <esp_types.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
@@ -61,6 +66,34 @@ namespace esphome {
 namespace opnpool {
 
 namespace poolstate_rx {
+
+    // Wall-clock of the last pump status message. The pump only appears on the bus while it
+    // is powered: if it stops, nothing arrives and the last decoded values would otherwise
+    // persist in Home Assistant forever, showing a stopped pump as running at its last known
+    // wattage. That is indistinguishable from a healthy pump, which is the worst kind of
+    // stale reading. See OpnPool::loop() for the timeout that acts on this.
+static int64_t _pump_last_seen_us = 0;
+int64_t pump_last_seen_us() { return _pump_last_seen_us; }
+
+    // Pump control mode. The pump reports whether it is taking orders from the automation
+    // (remote) or running its own onboard programs (local). Pentair's own documentation warns
+    // that a pump on RS-485 automation should NOT also be running local schedules, because the
+    // two fight -- which matches a pump that ran with every circuit off and could not be
+    // stopped from the panel. Upstream decodes this byte and discards it; surface it instead.
+static uint8_t _pump_ctrl_raw = 0;
+uint8_t pump_ctrl_raw() { return _pump_ctrl_raw; }
+
+    // Bytes 11..12 of the pump status message. Upstream labels this "remaining" but notes
+    // "some say its status bits". Measured here: it held a constant 1 across a full run at
+    // 2600W, and did not count down -- so on this pump it is NOT a timer, and the status-bits
+    // reading is the better one. Published raw rather than as a duration.
+static uint16_t _pump_remaining_raw = 0;
+uint16_t pump_remaining_raw() { return _pump_remaining_raw; }
+
+static uint8_t _last_clk_speed = 0x00;   // observed default
+static uint8_t _last_dst_auto  = 0x01;   // observed default (auto DST)
+uint8_t last_clk_speed() { return _last_clk_speed; }
+uint8_t last_dst_auto()  { return _last_dst_auto; }
 
 constexpr char TAG[] = "poolstate_rx";
 
@@ -298,7 +331,7 @@ _pump_reg_resp(cJSON * const dbg, network_pump_reg_resp_t const * const msg, dat
 static void
 _pump_ctrl(cJSON * const dbg, network_pump_ctrl_t const msg, datalink_pump_id_t const pump_id)
 {
-    // no change to poolstate
+    _pump_ctrl_raw = msg.raw;   // otherwise this message is decoded and thrown away
 
     if (ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE) {
        poolstate_rx_log::add_pump_ctrl(dbg, poolstate_rx_log::KEY_CTRL, pump_id, msg);
@@ -321,6 +354,16 @@ _pump_mode(cJSON * const dbg, network_pump_run_mode_t const msg, datalink_pump_i
 {
     if (!pumps) {
         ESP_LOGW(TAG, "null to %s", __func__);
+        return;
+    }
+
+    if (enum_index(pump_id) >= enum_count<datalink_pump_id_t>()) {
+            // pump_id is (addr & 0x0F) taken straight off the bus, so it spans 0..15, but
+            // pumps[] only has enum_count<datalink_pump_id_t>() (=2) entries. Any pump
+            // addressed 0x62..0x6F -- a third pump on the bus, or noise that happens to pass
+            // the checksum -- would otherwise write a ~32 byte struct off the end of a
+            // stack-local poolstate_t in OpnPool::loop(). Drop it instead.
+        ESP_LOGW(TAG, "%s: pump id %u out of range, ignoring", __func__, enum_index(pump_id));
         return;
     }
 
@@ -352,6 +395,12 @@ _pump_running(cJSON * const dbg, network_pump_running_t const * const msg, datal
 {
     if (!msg || !pumps) {
         ESP_LOGW(TAG, "null to %s", __func__);
+        return;
+    }
+
+    if (enum_index(pump_id) >= enum_count<datalink_pump_id_t>()) {
+            // bounds check; see _pump_mode() above for why this is needed
+        ESP_LOGW(TAG, "%s: pump id %u out of range, ignoring", __func__, enum_index(pump_id));
         return;
     }
 
@@ -390,6 +439,12 @@ _pump_status(cJSON * const dbg, network_pump_status_resp_t const * const msg, da
 {
     if (!msg || !pumps) {
         ESP_LOGW(TAG, "null to %s", __func__);
+        return;
+    }
+
+    if (enum_index(pump_id) >= enum_count<datalink_pump_id_t>()) {
+            // bounds check; see _pump_mode() above for why this is needed
+        ESP_LOGW(TAG, "%s: pump id %u out of range, ignoring", __func__, enum_index(pump_id));
         return;
     }
 
@@ -475,6 +530,9 @@ _ctrl_time(cJSON * const dbg, network_ctrl_time_t const * const msg, poolstate_t
         ESP_LOGW(TAG, "null to %s", __func__);
         return;
     }
+
+    _last_clk_speed = msg->clk_speed;
+    _last_dst_auto  = msg->dst_auto;
 
     state->system.tod = {
         .date = {
@@ -999,8 +1057,12 @@ update_state(network_msg_t const * const msg, poolstate_t * const new_state)
              break;
         case network_msg_typ_t::PUMP_STATUS_RESP:
             _pump_status(dbg, &msg->u.a5.pump_status_resp, pump_id, new_state->pumps);
+            _pump_last_seen_us = esp_timer_get_time();
+            _pump_remaining_raw =
+                (static_cast<uint16_t>(msg->u.a5.pump_status_resp.remaining.hour) << 8) |
+                 static_cast<uint16_t>(msg->u.a5.pump_status_resp.remaining.minute);
             break;
-        case network_msg_typ_t::CTRL_SET_ACK:  // response to various set requests
+        case network_msg_typ_t::CTRL_SET_ACK:
             _ctrl_set_ack(dbg, &msg->u.a5.ctrl_set_ack);
             break;
         case network_msg_typ_t::CTRL_CIRCUIT_SET:
@@ -1018,6 +1080,8 @@ update_state(network_msg_t const * const msg, poolstate_t * const new_state)
             break;
         case network_msg_typ_t::CTRL_TIME_SET:
         case network_msg_typ_t::CTRL_TIME_RESP:
+                // for the clock byte layout, incl. the dayoftheweek bitmask, see
+                // OpnPool::set_controller_clock() in core/opnpool.h
             _ctrl_time(dbg, &msg->u.a5.ctrl_time, new_state);
             break;
         case network_msg_typ_t::CTRL_HEAT_REQ:

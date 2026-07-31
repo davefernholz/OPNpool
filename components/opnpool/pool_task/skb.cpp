@@ -8,6 +8,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Public Domain (CC0-1.0)
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: CC0-1.0
  */
 
@@ -165,7 +168,8 @@ size_t
 skb_print(skb_handle_t const skb, char * const buf, size_t const buf_size)
 {
     size_t len = 0;
-    for (size_t ii = 0; ii < skb->len; ii++) {
+    // same underflow risk as datalink_rx.cpp's debug printers: guard against len reaching buf_size.
+    for (size_t ii = 0; ii < skb->len && len < buf_size; ii++) {
         len += snprintf(buf + len, buf_size - len, "%02x ", skb->priv.data[ii]);
     }
     return len;

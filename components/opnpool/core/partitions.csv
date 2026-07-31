@@ -1,10 +1,9 @@
-# OPNpool partition table for ESP32-C6 with 8MB flash
-# Provides larger app partitions for Matter/Thread support
-# Uses standard ESP32 offsets for bootloader compatibility
+# OPNpool partition table for ESP32 (classic) with 4MB flash, e.g. LilyGO T-CAN485.
+# The upstream table this replaces targeted an ESP32-C6 with 8MB flash for
+# Matter/Thread support; that doesn't fit this board's 4MB flash and matter
+# is disabled in this build.
 # Name,   Type, SubType, Offset,   Size
-nvs,      data, nvs,     0x9000,   0x4000
-otadata,  data, ota,     0xd000,   0x2000
-phy_init, data, phy,     0xf000,   0x1000
-app0,     app,  ota_0,   0x10000,  0x380000
-app1,     app,  ota_1,   0x390000, 0x380000
-storage,  data, fat,     0x710000, 0xF0000
+nvs,      data, nvs,     0x9000,   0x5000
+otadata,  data, ota,     0xe000,   0x2000
+app0,     app,  ota_0,   0x10000,  0x1C0000
+app1,     app,  ota_1,   0x1D0000, 0x1C0000

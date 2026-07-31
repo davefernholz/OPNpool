@@ -14,6 +14,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -64,7 +67,9 @@ using rs485_flush_fnc_t       = void (*)(void);
 using rs485_tx_mode_fnc_t     = void (*)(bool const tx_enable);
 
 /// @brief Function pointer: queues a packet for transmission.
-using rs485_queue_fnc_t       = void (*)(rs485_handle_t const handle, datalink_pkt_t const * const pkt);
+/// @param urgent  If true, jump the queue (user/HA-initiated commands should not wait
+///                behind periodic background polls).
+using rs485_queue_fnc_t       = void (*)(rs485_handle_t const handle, datalink_pkt_t const * const pkt, bool const urgent);
 
 /// @brief Function pointer: dequeues a packet from the transmit queue.
 using rs485_dequeue_fnc_t     = datalink_pkt_t const * (*)(rs485_handle_t const handle);
@@ -91,7 +96,12 @@ struct rs485_instance_t {
     rs485_tx_mode_fnc_t     tx_mode;      ///< Controls RTS pin for half-duplex direction.
     rs485_queue_fnc_t       queue;        ///< Queues packet to tx_q for transmission.
     rs485_dequeue_fnc_t     dequeue;      ///< Dequeues packet from tx_q.
-    QueueHandle_t           tx_q;         ///< FreeRTOS transmit queue handle.
+    QueueHandle_t           tx_q;         ///< Transmit queue for periodic poll requests.
+        /// Transmit queue for user/Home Assistant commands, drained before tx_q.
+        /// Separate from tx_q rather than using xQueueSendToFront on a single queue: pushing
+        /// to the front makes user commands LIFO relative to each other, so two rapid presses
+        /// transmit in reverse order and the circuit ends in the state of the EARLIER press.
+    QueueHandle_t           tx_q_urgent;
 };
 
 /// @}

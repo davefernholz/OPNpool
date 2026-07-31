@@ -18,9 +18,13 @@
  * 
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <cstring>
 #include <esp_system.h>
 #include <esp_types.h>
 #include <esphome/core/log.h>
@@ -233,7 +237,8 @@ OpnPoolClimate::control(const climate::ClimateCall &call)
 
         // handle heat source changes (based on custom preset)
 
-    char const * preset_str = call.get_custom_preset().c_str();
+    optional<std::string> const &custom_preset_opt = call.get_custom_preset();
+    char const * preset_str = custom_preset_opt.has_value() ? custom_preset_opt.value().c_str() : "";
     if (*preset_str != '\0') {
 
         ESP_LOGV(TAG, "HA requests %s to %s", enum_str(thermo_typ), preset_str);
@@ -331,8 +336,9 @@ OpnPoolClimate::publish_value_if_changed(
             // NONE is handled by the regular preset, not a custom preset
         if (strcasecmp(value_custom_preset, enum_str(network_heat_src_t::NONE)) == 0) {
             ESP_LOGVV(TAG, "Setting thermostat[%s] preset to NONE", enum_str(thermo_typ));
+            // set_preset_() already resets custom_preset (see set_alternative() in climate.cpp);
+            // current ESPHome has no separate clear_custom_preset_().
             set_preset_(climate::CLIMATE_PRESET_NONE);
-            clear_custom_preset_();
         } else {
             ESP_LOGVV(TAG, "Setting thermostat[%s] custom_preset to %s", enum_str(thermo_typ), value_custom_preset);
             this->set_custom_preset_(value_custom_preset);

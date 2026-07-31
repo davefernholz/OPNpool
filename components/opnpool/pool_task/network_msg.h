@@ -17,6 +17,9 @@
  *
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2014, 2019, 2022, 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
@@ -149,6 +152,12 @@ struct network_ctrl_circuit_set_t {
     constexpr bool get_value() const { return value != 0; }
 } PACK8;
 
+    /// @brief IntelliBrite light theme. Second byte is always zero in captured traffic.
+struct network_ctrl_light_set_t {
+    uint8_t theme;
+    uint8_t reserved;
+} PACK8;
+
 struct network_ctrl_sched_resp_sub_t {
     uint8_t         circuit_plus_1;  // 0  (0 = schedule not active)
     uint8_t         unknown_1;       // 1
@@ -174,13 +183,23 @@ struct uint8_heat_status_t {
 
     // portable bit map for combined heat source
 struct uint8_heat_src_t {
-    uint8_t bits;  // lower nibble is pool heat source; higher nibble is for spa
+    uint8_t bits;  // two bits per body: bits 0-1 = pool, bits 2-3 = spa
 
-    network_heat_src_t get_pool() const { return static_cast<network_heat_src_t>(bits & 0x0F); } 
-    network_heat_src_t get_spa()  const { return static_cast<network_heat_src_t>((bits >> 4) & 0x0F); }    
+        // Note this diverges from upstream, which packs 4 bits per body (pool = low nibble,
+        // spa = high nibble). The Pentair encoding is TWO bits per body, both inside the low
+        // nibble. Per the protocol reference this project cites:
+        //   "the pool and spa heat status [is] a 4 digit binary byte from 0000 (0) to 1111 (15).
+        //    The left two (xx__) is for the spa and the right two (__xx) are for the pool.
+        //    EG 1001 (9) would mean 10xx = 2 (Spa Solar Pref) and xx01 = 1 (Pool Heater)"
+        // Under the 4-bit masks a real byte of 0x05 decodes as pool=5 -- not a valid enum
+        // value, so it reaches Home Assistant as the literal string "05" and breaks the
+        // climate preset -- and spa=0 ("NONE"), when it actually means pool=Heater, spa=Heater.
+        // Values match network_heat_src_t: 0=NONE, 1=Heat, 2=SolarPreferred, 3=Solar.
+    network_heat_src_t get_pool() const { return static_cast<network_heat_src_t>(bits & 0x03); }
+    network_heat_src_t get_spa()  const { return static_cast<network_heat_src_t>((bits >> 2) & 0x03); }
 
-    void set_pool(network_heat_src_t src) { bits = (bits & 0xF0) | (static_cast<uint8_t>(src) & 0x0F); }
-    void set_spa( network_heat_src_t src) { bits = (bits & 0x0F) | (static_cast<uint8_t>(src) << 4); }
+    void set_pool(network_heat_src_t src) { bits = (bits & 0xFC) | (static_cast<uint8_t>(src) & 0x03); }
+    void set_spa( network_heat_src_t src) { bits = (bits & 0xF3) | ((static_cast<uint8_t>(src) & 0x03) << 2); }
 } PACK8;
 
 struct network_time_t {
@@ -225,7 +244,8 @@ struct network_ctrl_state_bcast_t {
 
 struct network_ctrl_time_t {
     network_time_t time;          // 0..1
-    uint8_t        dayoftheweek;  // 2
+    uint8_t        dayoftheweek;  // 2  bitmask, Sunday = bit 0 .. Saturday = bit 6 (0x20 = Friday),
+                                  //    verified against a live capture; see set_controller_clock()
     network_date_t date;          // 3..5
     uint8_t        clk_speed;     // 6
     uint8_t        dst_auto;      // 7 daylight savings time (1=auto, 0=manual)
@@ -303,6 +323,9 @@ struct network_ctrl_scheds_resp_t {
     network_pool_circuit_t circuit;      // 1
     network_time_t         start;        // 2..3
     network_time_t         stop;         // 4..5
+        // Upstream's encoding for the SCHEDULE message, untested here (this project does not
+        // write schedules). Note it differs from the CLOCK message's dayoftheweek above, which
+        // was verified against live traffic as Sunday = bit 0. Do not assume they agree.
     uint8_t                day_of_week;  // 6 ///< bitmask Mon (0x01), Tue (0x02), Wed (0x04), Thu(0x08), Fri (0x10), Sat (0x20), Sun(0x40)
 } PACK8;
 
@@ -523,6 +546,7 @@ union network_data_a5_t {
     network_pump_status_resp_t     pump_status_resp;
     network_ctrl_set_ack_t         ctrl_set_ack;
     network_ctrl_circuit_set_t     ctrl_circuit_set;
+    network_ctrl_light_set_t       ctrl_light_set;
     network_ctrl_sched_resp_t      ctrl_sched_resp;
     network_ctrl_state_bcast_t     ctrl_state_bcast;
     network_ctrl_time_t            ctrl_time;         // set or resp
@@ -597,6 +621,7 @@ union network_data_t {
     X(PUMP_STATUS_RESP,      sizeof(network_pump_status_resp_t),    false, A5_PUMP, datalink_pump_typ_t::STATUS)       \
     X(CTRL_SET_ACK,          sizeof(network_ctrl_set_ack_t),        false, A5_CTRL, datalink_ctrl_typ_t::SET_ACK)      \
     X(CTRL_CIRCUIT_SET,      sizeof(network_ctrl_circuit_set_t),    false, A5_CTRL, datalink_ctrl_typ_t::CIRCUIT_SET)  \
+    X(CTRL_LIGHT_SET,        sizeof(network_ctrl_light_set_t),      false, A5_CTRL, datalink_ctrl_typ_t::LIGHT_SET)    \
     X(CTRL_SCHED_REQ,        0,                                     false, A5_CTRL, datalink_ctrl_typ_t::SCHED_REQ)    \
     X(CTRL_SCHED_RESP,       sizeof(network_ctrl_sched_resp_t),     false, A5_CTRL, datalink_ctrl_typ_t::SCHED_RESP)   \
     X(CTRL_STATE_BCAST,      sizeof(network_ctrl_state_bcast_t),    false, A5_CTRL, datalink_ctrl_typ_t::STATE_BCAST)  \

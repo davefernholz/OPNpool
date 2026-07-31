@@ -20,10 +20,14 @@
  * 
  * @author Coert Vonk (@cvonk on GitHub)
  * @copyright Copyright (c) 2026 Coert Vonk
+ * @modified 2026 by Dave Fernholz -- LilyGO T-CAN485 (ESP32, 4MB flash) support,
+ *           upstream defect fixes, and ESPHome / ESP-IDF 5.x compatibility.
+ *           See CHANGES.md in the repository root for the full list.
  * @license SPDX-License-Identifier: GPL-3.0-or-later
  */
 
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <esphome/core/log.h>
 
 #include "opnpool_switch.h"   // no other #includes that could make a circular dependency
@@ -41,6 +45,22 @@ namespace esphome {
 namespace opnpool {
 
 constexpr char TAG[] = "opnpool_switch";
+
+    // How long to trust our own optimistic switch state before deferring back to whatever the
+    // controller reports. Long enough to cover the transmit-opportunity wait (~1s) plus the
+    // controller acting and re-broadcasting, short enough that a genuinely failed command
+    // visibly reverts in Home Assistant rather than lying indefinitely.
+constexpr int64_t PENDING_TIMEOUT_US = 8 * 1000000;
+
+    // Command outcome counters, surfaced as Home Assistant diagnostics (see opnpool.h).
+    // These exist because a dropped command is otherwise invisible: the only signal was a
+    // log line, and the log stream can disconnect without warning.
+static uint32_t _cmds_sent        = 0;
+static uint32_t _cmds_unconfirmed = 0;
+static uint32_t _cmds_dropped     = 0;
+uint32_t opnpool_cmd_sent_count()        { return _cmds_sent; }
+uint32_t opnpool_cmd_unconfirmed_count() { return _cmds_unconfirmed; }
+uint32_t opnpool_cmd_dropped_count()     { return _cmds_dropped; }
 
 /**
  * @brief Dump the configuration and last known state of the switch entity.
@@ -106,10 +126,27 @@ OpnPoolSwitch::write_state(bool value)
 
     ESP_LOGVV(TAG, "Sending CIRCUIT_SET command: circuit+1=%u to %u", msg.u.a5.ctrl_circuit_set.circuit_plus_1, msg.u.ctrl_circuit_set.value);
     if (ipc_send_network_msg_to_pool_task(&msg, this->parent_->get_ipc()) != ESP_OK) {
+            // Do not publish optimistically below: the command never reached the queue, so
+            // nothing will ever confirm it. Showing the requested state for PENDING_TIMEOUT_US
+            // and then warning about a missing confirmation misreports a send that never
+            // happened. Leave the switch showing the controller's actual state.
+        _cmds_dropped++;
         ESP_LOGW(TAG, "Failed to send CIRCUIT_SET message to pool task");
+        return;
     }
 
-    // DON'T publish state here - wait for pool controller confirmation
+        // Publish the requested value immediately and start suppressing contradicting
+        // controller updates until it confirms (or we give up). Waiting for confirmation
+        // without doing this is what made the Home Assistant toggle flicker ON -> OFF -> ON:
+        // the command sits in the tx queue until the next transmit opportunity while the
+        // controller keeps broadcasting the old state, which HA renders as a revert.
+    _cmds_sent++;
+    pending_valid_    = true;
+    pending_value_    = value;
+    pending_until_us_ = esp_timer_get_time() + PENDING_TIMEOUT_US;
+
+    this->publish_state(value);
+    last_ = { .valid = true, .value = value };
 }
 
 /**
@@ -125,6 +162,23 @@ OpnPoolSwitch::write_state(bool value)
 void
 OpnPoolSwitch::publish_value_if_changed(bool value)
 {
+        // While a write is awaiting confirmation, ignore controller updates that contradict
+        // what we asked for -- those are just stale broadcasts from before the command
+        // landed, and publishing them makes the Home Assistant toggle flicker back.
+    if (pending_valid_) {
+        if (value == pending_value_) {
+            pending_valid_ = false;        // controller confirmed; resume normal behaviour
+        } else if (esp_timer_get_time() < pending_until_us_) {
+            return;                        // still waiting -- suppress the stale value
+        } else {
+            pending_valid_ = false;        // gave up: let the real state through so a
+                                           // genuinely failed command is visible in HA
+            _cmds_unconfirmed++;
+            ESP_LOGW(TAG, "%s: no confirmation within %llds, reverting to controller state",
+                     enum_str(circuit_), (long long)(PENDING_TIMEOUT_US / 1000000));
+        }
+    }
+
     if (!last_.valid || last_.value != value) {
 
         this->publish_state(value);
